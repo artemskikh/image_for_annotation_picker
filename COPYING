@@ -1,0 +1,63 @@
+LICENSING INFORMATION FOR IMAGE ANNOTATION PICKER
+================================================
+
+This software consists of multiple components with different licenses:
+
+1. APPLICATION CODE (MIT LICENSE)
+----------------------------------
+The main application code (all files in src/ directory except third-party libraries)
+is licensed under the MIT License. See LICENSE file for full terms.
+
+2. QT LIBRARIES (LGPL V3)
+--------------------------
+This application uses Qt Community Edition, licensed under GNU Lesser General
+Public License (LGPL) version 3.
+
+Qt Components Used:
+- Qt6Core
+- Qt6Widgets
+- Qt6Multimedia
+- Qt6MultimediaWidgets
+
+Qt License Information:
+- License: GNU Lesser General Public License (LGPL) v3
+- Copyright: © The Qt Company Ltd.
+- Website: https://www.qt.io/
+- License Text: https://www.gnu.org/licenses/lgpl-3.0.html
+- Source Code: https://code.qt.io/
+
+LGPL v3 Compliance:
+- Qt libraries are dynamically linked (not modified or statically linked)
+- Users can replace Qt libraries with compatible versions
+- No Qt source code is included in this repository
+- Qt source code is available from The Qt Company
+
+3. SPDLOG LIBRARY (MIT LICENSE)
+--------------------------------
+This application includes spdlog as a git submodule.
+
+- Location: third_party/spdlog/
+- License: MIT License
+- Copyright: © 2016 Gabi Melman
+- Repository: https://github.com/gabime/spdlog
+
+DISTRIBUTION REQUIREMENTS
+=========================
+
+When distributing this application:
+
+1. Include this COPYING file and the LICENSE file
+2. Ensure Qt libraries are dynamically linked
+3. Inform users of their rights under LGPL v3 regarding Qt libraries
+4. Provide information on how to obtain Qt source code
+5. Do not remove Qt copyright notices from the application
+
+COMMERCIAL USE
+==============
+
+- Application code (MIT): Commercial use permitted
+- Qt (LGPL v3): Commercial use permitted with dynamic linking
+- For commercial Qt support or static linking, contact The Qt Company for commercial licensing
+
+For questions about licensing compliance, consult with a legal professional
+familiar with open-source software licensing.
