@@ -6,9 +6,29 @@
 #include <QPixmap>
 #include <QVideoFrame>
 #include <QVideoSink>
+#include <QPainter>
+#include <QTimer>
+#include <QFileInfo>
+#include <QSettings>
+#include <QEvent>
+#include <QFont>
+#include <QTime>
+
+// FrameCaptureSink implementation
+FrameCaptureSink::FrameCaptureSink(QObject *parent)
+    : QVideoSink(parent)
+{
+    connect(this, &QVideoSink::videoFrameChanged, this, &FrameCaptureSink::onFrameChanged);
+}
+
+void FrameCaptureSink::onFrameChanged(const QVideoFrame &frame)
+{
+    m_currentFrame = frame;
+    emit frameAvailable();
+}
 
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(100), m_videoDuration(0), m_isPlaying(false)
+    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(100), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr)
 {
     setupUI();
     setupMenuBar();
@@ -20,8 +40,14 @@ MainWindow::MainWindow(QWidget *parent)
     m_frameStepTimer->setSingleShot(false);
     connect(m_frameStepTimer, &QTimer::timeout, this, &MainWindow::onFrameStepTimer);
 
-    // Set default output directory
-    m_outputDirectory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/AnnotationFrames";
+    // Load settings before setting default values
+    loadSettings();
+
+    // Set default output directory if not loaded from settings
+    if (m_outputDirectory.isEmpty())
+    {
+        m_outputDirectory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/AnnotationFrames";
+    }
     m_outputDirEdit->setText(m_outputDirectory);
 
     // Create output directory if it doesn't exist
@@ -30,12 +56,19 @@ MainWindow::MainWindow(QWidget *parent)
     setWindowTitle("Image Annotation Picker");
     resize(1200, 800);
 
+    // Ensure main window can receive keyboard events
+    setFocusPolicy(Qt::StrongFocus);
+    setFocus();
+
     // Show keyboard shortcuts in status bar initially
     statusBar()->showMessage("Keyboard shortcuts: ← → (frame navigation), Space (play/pause), Ctrl+S (save frame)", 5000);
 }
 
 MainWindow::~MainWindow()
 {
+    // Save settings before cleanup
+    saveSettings();
+
     if (m_mediaPlayer)
     {
         m_mediaPlayer->stop();
@@ -60,6 +93,22 @@ void MainWindow::setupUI()
     m_mediaPlayer = new QMediaPlayer;
     m_mediaPlayer->setVideoOutput(m_videoDisplay);
 
+    // Create frame capture sink for saving frames
+    m_frameCaptureSink = new FrameCaptureSink(this);
+    connect(m_frameCaptureSink, &FrameCaptureSink::frameAvailable, this, &MainWindow::onFrameAvailable);
+    LOG_INFO("Created frame capture sink");
+
+    // Connect to the video widget's sink to capture frames
+    QVideoSink *displaySink = m_videoDisplay->videoSink();
+    if (displaySink)
+    {
+        connect(displaySink, &QVideoSink::videoFrameChanged, m_frameCaptureSink, &FrameCaptureSink::onFrameChanged);
+        LOG_INFO("Connected to display sink for frame capture");
+    }
+    else
+    {
+        LOG_ERROR("Failed to get display sink from video widget");
+    }
     videoLayout->addWidget(m_videoDisplay);
 
     // Setup controls
@@ -104,7 +153,18 @@ void MainWindow::setupUI()
     m_frameListWidget->setMinimumWidth(300);
     QVBoxLayout *frameLayout = new QVBoxLayout(m_frameListWidget);
 
+    // Frame list title with toggle button
+    QHBoxLayout *frameListTitleLayout = new QHBoxLayout;
     QLabel *frameListTitle = new QLabel("Selected Frames");
+    frameListTitle->setStyleSheet("font-weight: bold;");
+    m_toggleFrameListBtn = new QPushButton("<<");
+    m_toggleFrameListBtn->setFixedSize(30, 25);
+    m_toggleFrameListBtn->setToolTip("Hide/Show frame list panel");
+
+    frameListTitleLayout->addWidget(frameListTitle);
+    frameListTitleLayout->addStretch();
+    frameListTitleLayout->addWidget(m_toggleFrameListBtn);
+    frameListTitleLayout->setContentsMargins(0, 0, 0, 0);
     frameListTitle->setStyleSheet("font-weight: bold; font-size: 14px;");
     m_frameList = new QListWidget;
     m_frameCountLabel = new QLabel("Frames: 0");
@@ -142,10 +202,26 @@ void MainWindow::setupUI()
     formatLayout->addWidget(m_imageFormatCombo);
     formatLayout->addStretch();
 
+    // Filename prefix layout
+    QHBoxLayout *filenamePrefixLayout = new QHBoxLayout;
+    QLabel *filenamePrefixLabel = new QLabel("Filename Prefix:");
+    m_filenamePrefixEdit = new QLineEdit("frame");
+    m_filenamePrefixEdit->setMinimumWidth(150); // Make it wider
+
+    // Put pattern hint on next line to save space
+    QLabel *patternHint = new QLabel("Pattern: <prefix>_<timestamp>_<width>_<height>.png");
+    patternHint->setStyleSheet("color: gray; font-style: italic; font-size: 10px;");
+
+    filenamePrefixLayout->addWidget(filenamePrefixLabel);
+    filenamePrefixLayout->addWidget(m_filenamePrefixEdit);
+    filenamePrefixLayout->addStretch();
+
     settingsLayout->addLayout(outputDirLayout);
     settingsLayout->addLayout(formatLayout);
+    settingsLayout->addLayout(filenamePrefixLayout);
+    settingsLayout->addWidget(patternHint);
 
-    frameLayout->addWidget(frameListTitle);
+    frameLayout->addLayout(frameListTitleLayout);
     frameLayout->addWidget(m_frameList);
     frameLayout->addWidget(m_frameCountLabel);
     frameLayout->addLayout(frameControlsLayout);
@@ -273,7 +349,23 @@ void MainWindow::connectSignals()
         if (!dir.isEmpty()) {
             m_outputDirectory = dir;
             m_outputDirEdit->setText(dir);
+
+            // Save settings immediately when directory changes
+            saveSettings();
+
+            LOG_INFO("Output directory changed to: {}", dir.toStdString());
         } });
+
+    // Toggle frame list visibility
+    connect(m_toggleFrameListBtn, &QPushButton::clicked, [this]()
+            {
+        bool isVisible = m_frameListWidget->isVisible();
+        m_frameListWidget->setVisible(!isVisible);
+        m_toggleFrameListBtn->setText(isVisible ? ">>" : "<<");
+        m_toggleFrameListBtn->setToolTip(isVisible ? "Show frame list panel" : "Hide frame list panel"); });
+
+    // Add event filter to video widget to restore focus when clicked
+    m_videoDisplay->installEventFilter(this);
 }
 
 void MainWindow::updateControls()
@@ -294,14 +386,30 @@ void MainWindow::updateControls()
 
 void MainWindow::openVideo()
 {
+    // Start file dialog from last video directory or home
+    QString startDir = m_lastVideoPath.isEmpty() ? QDir::homePath() : QFileInfo(m_lastVideoPath).absolutePath();
+
     QString fileName = QFileDialog::getOpenFileName(this,
-                                                    "Open Video File", QString(),
+                                                    "Open Video File",
+                                                    startDir,
                                                     "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm)");
 
     if (!fileName.isEmpty())
     {
         LOG_INFO("Opening video file: {}", fileName.toStdString());
         m_currentVideoPath = fileName;
+        m_lastVideoPath = fileName; // Remember for next time
+
+        // Save settings immediately when new video is loaded
+        saveSettings();
+
+        // Set default filename prefix from video filename
+        setDefaultFilenamePrefix(fileName);
+
+        // Set up dual output: video widget for display and video sink for frame capture
+        m_mediaPlayer->setVideoOutput(m_videoDisplay);
+        // Note: In Qt6, we can't easily have dual outputs, so we'll use a different approach
+
         m_mediaPlayer->setSource(QUrl::fromLocalFile(fileName));
         statusBar()->showMessage("Loaded: " + QFileInfo(fileName).fileName(), 3000);
         updateControls();
@@ -320,17 +428,8 @@ void MainWindow::saveCurrentFrame()
         return;
     }
 
-    // For now, we'll add a placeholder entry to the list
-    // In a real implementation, you'd capture the actual frame from the video
-    qint64 currentPos = m_mediaPlayer->position();
-    QString timestamp = formatTime(currentPos);
-    QString frameName = QString("Frame_%1_%2.%3")
-                            .arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"))
-                            .arg(currentPos)
-                            .arg(m_imageFormatCombo->currentText().toLower());
-
-    addFrameToList(frameName, currentPos);
-    statusBar()->showMessage("Frame saved: " + timestamp, 2000);
+    // Use the new frame capture implementation
+    captureCurrentFrame();
 }
 
 void MainWindow::playPause()
@@ -355,26 +454,41 @@ void MainWindow::playPause()
 
 void MainWindow::nextFrame()
 {
-    // Jump forward by approximately one frame (assuming 30 fps)
+    // Jump forward by a larger amount to ensure we hit different frames
+    // Use 100ms jumps instead of 33ms to avoid getting stuck between keyframes
     qint64 currentPos = m_mediaPlayer->position();
-    qint64 frameTime = 1000 / 30; // ~33ms per frame for 30fps
+    qint64 frameTime = 100; // 100ms per step for more reliable frame changes
     qint64 newPos = qMin(currentPos + frameTime, m_videoDuration);
 
     LOG_DEBUG("nextFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
 
+    // Force a proper seek that will update the video display
     m_mediaPlayer->setPosition(newPos);
+
+    // Small delay to ensure the frame is processed
+    QTimer::singleShot(10, [this]()
+                       {
+        // This ensures the video widget updates its display
+        m_videoDisplay->update(); });
 }
 
 void MainWindow::previousFrame()
 {
-    // Jump backward by approximately one frame
+    // Jump backward by a larger amount to ensure we hit different frames
     qint64 currentPos = m_mediaPlayer->position();
-    qint64 frameTime = 1000 / 30;
+    qint64 frameTime = 100; // 100ms per step for more reliable frame changes
     qint64 newPos = qMax(currentPos - frameTime, 0LL);
 
     LOG_DEBUG("previousFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
 
+    // Force a proper seek that will update the video display
     m_mediaPlayer->setPosition(newPos);
+
+    // Small delay to ensure the frame is processed
+    QTimer::singleShot(10, [this]()
+                       {
+        // This ensures the video widget updates its display
+        m_videoDisplay->update(); });
 }
 
 void MainWindow::seekToPosition(int position)
@@ -462,6 +576,41 @@ void MainWindow::onMediaStatusChanged(QMediaPlayer::MediaStatus status)
         break;
     default:
         break;
+    }
+}
+
+void MainWindow::onMediaError(QMediaPlayer::Error error, const QString &errorString)
+{
+    QString errorTypeStr;
+    switch (error)
+    {
+    case QMediaPlayer::NoError:
+        errorTypeStr = "NoError";
+        break;
+    case QMediaPlayer::ResourceError:
+        errorTypeStr = "ResourceError";
+        break;
+    case QMediaPlayer::FormatError:
+        errorTypeStr = "FormatError";
+        break;
+    case QMediaPlayer::NetworkError:
+        errorTypeStr = "NetworkError";
+        break;
+    case QMediaPlayer::AccessDeniedError:
+        errorTypeStr = "AccessDeniedError";
+        break;
+    default:
+        errorTypeStr = "UnknownError";
+        break;
+    }
+
+    LOG_ERROR("Media player error - Type: {}, Message: {}", errorTypeStr.toStdString(), errorString.toStdString());
+
+    if (error != QMediaPlayer::NoError)
+    {
+        statusBar()->showMessage(QString("Media Error: %1").arg(errorString), 5000);
+        QMessageBox::critical(this, "Media Error",
+                              QString("Error Type: %1\nMessage: %2").arg(errorTypeStr, errorString));
     }
 }
 
@@ -668,6 +817,17 @@ void MainWindow::mousePressEvent(QMouseEvent *event)
     QMainWindow::mousePressEvent(event);
 }
 
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_videoDisplay && event->type() == QEvent::MouseButtonPress)
+    {
+        LOG_DEBUG("Video widget clicked - restoring keyboard focus to main window");
+        setFocus();
+        return false; // Let the event continue to be processed
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::onFrameStepTimer()
 {
     if (m_isSteppingForward)
@@ -722,4 +882,236 @@ QString MainWindow::formatTime(qint64 milliseconds)
             .arg(minutes, 2, 10, QChar('0'))
             .arg(seconds, 2, 10, QChar('0'));
     }
+}
+
+QString MainWindow::extractFilenamePrefix(const QString &videoPath)
+{
+    QFileInfo fileInfo(videoPath);
+    QString baseName = fileInfo.baseName(); // Gets filename without extension
+
+    // Look for first underscore to split
+    int underscoreIndex = baseName.indexOf('_');
+    if (underscoreIndex != -1)
+    {
+        return baseName.left(underscoreIndex);
+    }
+
+    // If no underscore, take first 10 characters
+    return baseName.left(10);
+}
+
+void MainWindow::setDefaultFilenamePrefix(const QString &videoPath)
+{
+    if (m_filenamePrefixEdit && !videoPath.isEmpty())
+    {
+        QString prefix = extractFilenamePrefix(videoPath);
+        if (!prefix.isEmpty())
+        {
+            m_filenamePrefixEdit->setText(prefix);
+            LOG_INFO("Set filename prefix to: {}", prefix.toStdString());
+        }
+    }
+}
+
+void MainWindow::loadSettings()
+{
+    LOG_INFO("Loading application settings");
+    QSettings settings;
+
+    // Load last video path
+    QString lastVideoPath = settings.value("lastVideoPath", "").toString();
+    if (!lastVideoPath.isEmpty() && QFileInfo::exists(lastVideoPath))
+    {
+        LOG_INFO("Restored last video path: {}", lastVideoPath.toStdString());
+        m_lastVideoPath = lastVideoPath;
+    }
+
+    // Load output directory
+    QString outputDir = settings.value("outputDirectory", "").toString();
+    if (!outputDir.isEmpty() && QDir(outputDir).exists())
+    {
+        m_outputDirectory = outputDir;
+        LOG_INFO("Restored output directory: {}", outputDir.toStdString());
+    }
+
+    // Load filename prefix
+    QString filenamePrefix = settings.value("filenamePrefix", "frame").toString();
+    if (m_filenamePrefixEdit)
+    {
+        m_filenamePrefixEdit->setText(filenamePrefix);
+        LOG_INFO("Restored filename prefix: {}", filenamePrefix.toStdString());
+    }
+
+    // Load window geometry
+    QByteArray geometry = settings.value("geometry").toByteArray();
+    if (!geometry.isEmpty())
+    {
+        restoreGeometry(geometry);
+        LOG_INFO("Restored window geometry");
+    }
+}
+
+void MainWindow::saveSettings()
+{
+    LOG_INFO("Saving application settings");
+    QSettings settings;
+
+    // Save last video path
+    if (!m_lastVideoPath.isEmpty())
+    {
+        settings.setValue("lastVideoPath", m_lastVideoPath);
+        LOG_INFO("Saved last video path: {}", m_lastVideoPath.toStdString());
+    }
+
+    // Save output directory
+    settings.setValue("outputDirectory", m_outputDirectory);
+    LOG_INFO("Saved output directory: {}", m_outputDirectory.toStdString());
+
+    // Save filename prefix
+    if (m_filenamePrefixEdit)
+    {
+        QString prefix = m_filenamePrefixEdit->text().trimmed();
+        if (prefix.isEmpty())
+        {
+            prefix = "frame";
+        }
+        settings.setValue("filenamePrefix", prefix);
+        LOG_INFO("Saved filename prefix: {}", prefix.toStdString());
+    }
+
+    // Save window geometry
+    settings.setValue("geometry", saveGeometry());
+    LOG_INFO("Saved window geometry");
+}
+
+QString MainWindow::generateFrameFilename()
+{
+    QString prefix = "frame";
+    if (m_filenamePrefixEdit)
+    {
+        QString userPrefix = m_filenamePrefixEdit->text().trimmed();
+        if (!userPrefix.isEmpty())
+        {
+            prefix = userPrefix;
+        }
+    }
+
+    // Get current timestamp
+    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
+
+    // Get video size if available - fallback to default size for filename
+    QSize videoSize = QSize(1920, 1080);
+    if (m_frameCaptureSink)
+    {
+        QVideoFrame currentFrame = m_frameCaptureSink->getCurrentFrame();
+        if (currentFrame.isValid())
+        {
+            videoSize = currentFrame.size();
+        }
+    }
+
+    // Generate filename: prefix_timestamp_width_height.png
+    return QString("%1_%2_%3_%4.png")
+        .arg(prefix)
+        .arg(timestamp)
+        .arg(videoSize.width())
+        .arg(videoSize.height());
+}
+
+void MainWindow::captureCurrentFrame()
+{
+    if (!m_mediaPlayer || m_mediaPlayer->playbackState() == QMediaPlayer::StoppedState)
+    {
+        LOG_ERROR("Cannot capture frame: no video loaded or player stopped");
+        return;
+    }
+
+    LOG_INFO("Attempting to capture current frame");
+
+    // Generate filename with current prefix
+    QString filename = generateFrameFilename();
+    QString fullPath = QDir(m_outputDirectory).absoluteFilePath(filename);
+
+    QPixmap framePixmap;
+
+    // Try to capture from frame capture sink
+    if (m_frameCaptureSink)
+    {
+        QVideoFrame currentFrame = m_frameCaptureSink->getCurrentFrame();
+        LOG_INFO("Frame capture sink exists, current frame valid: {}", currentFrame.isValid());
+
+        if (currentFrame.isValid())
+        {
+            LOG_INFO("Capturing frame from video sink, size: {}x{}, format: {}",
+                     currentFrame.size().width(), currentFrame.size().height(), (int)currentFrame.pixelFormat());
+
+            // Convert QVideoFrame to QImage
+            QVideoFrame mappedFrame = currentFrame;
+            mappedFrame.map(QVideoFrame::ReadOnly);
+
+            QImage frameImage = mappedFrame.toImage();
+
+            if (!frameImage.isNull())
+            {
+                // Ensure proper color format - convert to RGB32 if needed for consistent output
+                if (frameImage.format() != QImage::Format_RGB32 && frameImage.format() != QImage::Format_ARGB32)
+                {
+                    LOG_INFO("Converting image format from {} to RGB32", (int)frameImage.format());
+                    frameImage = frameImage.convertToFormat(QImage::Format_RGB32);
+                }
+
+                framePixmap = QPixmap::fromImage(frameImage);
+                LOG_INFO("Successfully converted video frame to pixmap, size: {}x{}, image format: {}",
+                         framePixmap.width(), framePixmap.height(), (int)frameImage.format());
+            }
+            else
+            {
+                LOG_ERROR("Failed to convert video frame to image");
+            }
+
+            mappedFrame.unmap();
+        }
+        else
+        {
+            LOG_ERROR("No valid frame available from capture sink");
+        }
+    }
+
+    // Fallback to placeholder if frame capture failed
+    if (framePixmap.isNull())
+    {
+        LOG_INFO("Using placeholder image - video frame capture failed");
+        framePixmap = QPixmap(800, 600);
+        framePixmap.fill(Qt::darkGray);
+
+        QPainter painter(&framePixmap);
+        painter.setPen(Qt::white);
+        painter.setFont(QFont("Arial", 16));
+        painter.drawText(framePixmap.rect(), Qt::AlignCenter,
+                         QString("Frame capture failed\nPosition: %1ms\nTry playing the video first")
+                             .arg(m_mediaPlayer->position()));
+    }
+
+    if (framePixmap.save(fullPath))
+    {
+        LOG_INFO("Frame saved to: {}", fullPath.toStdString());
+
+        // Add to frame list using just the filename (without extension for display)
+        QFileInfo fileInfo(filename);
+        addFrameToList(fileInfo.baseName(), m_mediaPlayer->position());
+
+        statusBar()->showMessage(QString("Frame saved: %1").arg(filename), 3000);
+    }
+    else
+    {
+        LOG_ERROR("Failed to save frame to: {}", fullPath.toStdString());
+        statusBar()->showMessage("Failed to save frame", 3000);
+    }
+}
+
+void MainWindow::onFrameAvailable()
+{
+    // This slot is called when a new frame is available from the FrameCaptureSink
+    // It's currently just a notification - the actual frame access happens in captureCurrentFrame()
+    // We could use this for real-time frame processing if needed
 }
