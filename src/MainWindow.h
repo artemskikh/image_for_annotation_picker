@@ -31,25 +31,7 @@
 #include <QVideoSink>
 #include <QVideoFrame>
 #include "Logger.h"
-
-// Custom video sink to capture frames
-class FrameCaptureSink : public QVideoSink
-{
-    Q_OBJECT
-
-public:
-    explicit FrameCaptureSink(QObject *parent = nullptr);
-    QVideoFrame getCurrentFrame() const { return m_currentFrame; }
-
-public slots:
-    void onFrameChanged(const QVideoFrame &frame);
-
-signals:
-    void frameAvailable();
-
-private:
-    QVideoFrame m_currentFrame;
-};
+#include "FrameCaptureSink.h"
 
 class MainWindow : public QMainWindow
 {
@@ -95,6 +77,17 @@ private:
     void captureCurrentFrame();
     QString extractFilenamePrefix(const QString &videoPath);
     void setDefaultFilenamePrefix(const QString &videoPath);
+
+    // Frame capture methods
+    enum FrameCaptureMethod
+    {
+        CAPTURE_QT_SINK, // Use Qt's QVideoSink (current method)
+        CAPTURE_FFMPEG   // Use ffmpeg subprocess
+    };
+
+    void captureCurrentFrameQt();
+    void captureCurrentFrameFFmpeg();
+    bool checkFFmpegAvailable();
 
     // UI Components
     QWidget *m_centralWidget;
@@ -155,6 +148,14 @@ private:
     qint64 m_videoDuration;
     bool m_isPlaying;
     QPushButton *m_toggleFrameListBtn; // Button to toggle frame list visibility
+
+    // Frame capture configuration
+    FrameCaptureMethod m_frameCaptureMethod;
+    bool m_ffmpegAvailable;
+
+    // Position update throttling
+    qint64 m_lastPositionUpdate;
+    qint64 m_lastUIUpdate;
 };
 
 #endif // MAINWINDOW_H

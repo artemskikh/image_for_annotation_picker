@@ -13,22 +13,10 @@
 #include <QEvent>
 #include <QFont>
 #include <QTime>
-
-// FrameCaptureSink implementation
-FrameCaptureSink::FrameCaptureSink(QObject *parent)
-    : QVideoSink(parent)
-{
-    connect(this, &QVideoSink::videoFrameChanged, this, &FrameCaptureSink::onFrameChanged);
-}
-
-void FrameCaptureSink::onFrameChanged(const QVideoFrame &frame)
-{
-    m_currentFrame = frame;
-    emit frameAvailable();
-}
+#include <QProcess>
 
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(100), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr)
+    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(200), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr), m_frameCaptureMethod(CAPTURE_QT_SINK), m_ffmpegAvailable(false), m_lastPositionUpdate(0), m_lastUIUpdate(0)
 {
     setupUI();
     setupMenuBar();
@@ -42,6 +30,14 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Load settings before setting default values
     loadSettings();
+
+    // Check ffmpeg availability and set default capture method
+    m_ffmpegAvailable = checkFFmpegAvailable();
+    m_frameCaptureMethod = m_ffmpegAvailable ? CAPTURE_FFMPEG : CAPTURE_QT_SINK;
+
+    LOG_INFO("FFmpeg available: {}, using capture method: {}",
+             m_ffmpegAvailable,
+             m_frameCaptureMethod == CAPTURE_FFMPEG ? "FFmpeg" : "Qt Sink");
 
     // Set default output directory if not loaded from settings
     if (m_outputDirectory.isEmpty())
@@ -60,8 +56,8 @@ MainWindow::MainWindow(QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
     setFocus();
 
-    // Show keyboard shortcuts in status bar initially
-    statusBar()->showMessage("Keyboard shortcuts: ← → (frame navigation), Space (play/pause), Ctrl+S (save frame)", 5000);
+    // Show keyboard shortcuts in status bar initially - shortened duration to avoid potential freezing
+    statusBar()->showMessage("Keyboard shortcuts: ← → (frame navigation), Space (play/pause), Ctrl+S (save frame)", 2000);
 }
 
 MainWindow::~MainWindow()
@@ -454,41 +450,57 @@ void MainWindow::playPause()
 
 void MainWindow::nextFrame()
 {
+    // Throttle position updates to avoid overwhelming the media player
+    qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    if (currentTime - m_lastPositionUpdate < 30)
+    { // Minimum 30ms between updates
+        return;
+    }
+    m_lastPositionUpdate = currentTime;
+
     // Jump forward by a larger amount to ensure we hit different frames
     // Use 100ms jumps instead of 33ms to avoid getting stuck between keyframes
     qint64 currentPos = m_mediaPlayer->position();
     qint64 frameTime = 100; // 100ms per step for more reliable frame changes
     qint64 newPos = qMin(currentPos + frameTime, m_videoDuration);
 
-    LOG_DEBUG("nextFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+    // Only log occasionally to reduce UI overhead during rapid stepping
+    static qint64 lastLogTime = 0;
+    if (currentTime - lastLogTime > 500)
+    { // Log every 500ms max
+        LOG_DEBUG("nextFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+        lastLogTime = currentTime;
+    }
 
-    // Force a proper seek that will update the video display
+    // Direct position update without additional timers
     m_mediaPlayer->setPosition(newPos);
-
-    // Small delay to ensure the frame is processed
-    QTimer::singleShot(10, [this]()
-                       {
-        // This ensures the video widget updates its display
-        m_videoDisplay->update(); });
 }
 
 void MainWindow::previousFrame()
 {
+    // Throttle position updates to avoid overwhelming the media player
+    qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    if (currentTime - m_lastPositionUpdate < 30)
+    { // Minimum 30ms between updates
+        return;
+    }
+    m_lastPositionUpdate = currentTime;
+
     // Jump backward by a larger amount to ensure we hit different frames
     qint64 currentPos = m_mediaPlayer->position();
     qint64 frameTime = 100; // 100ms per step for more reliable frame changes
     qint64 newPos = qMax(currentPos - frameTime, 0LL);
 
-    LOG_DEBUG("previousFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+    // Only log occasionally to reduce UI overhead during rapid stepping
+    static qint64 lastLogTime = 0;
+    if (currentTime - lastLogTime > 500)
+    { // Log every 500ms max
+        LOG_DEBUG("previousFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+        lastLogTime = currentTime;
+    }
 
-    // Force a proper seek that will update the video display
+    // Direct position update without additional timers
     m_mediaPlayer->setPosition(newPos);
-
-    // Small delay to ensure the frame is processed
-    QTimer::singleShot(10, [this]()
-                       {
-        // This ensures the video widget updates its display
-        m_videoDisplay->update(); });
 }
 
 void MainWindow::seekToPosition(int position)
@@ -502,17 +514,28 @@ void MainWindow::seekToPosition(int position)
 
 void MainWindow::onPositionChanged(qint64 position)
 {
+    // Throttle UI updates to reduce overhead - only update every 100ms
+    qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    bool shouldUpdateUI = (currentTime - m_lastUIUpdate > 100);
+
+    // Always update slider position if not being dragged (this is lightweight)
     if (!m_positionSlider->isSliderDown())
     {
         m_positionSlider->setValue(static_cast<int>(position));
     }
-    m_timeLabel->setText(formatTime(position));
 
-    // Only log position changes occasionally to avoid spam
+    // Only update time label periodically to reduce UI overhead
+    if (shouldUpdateUI)
+    {
+        m_timeLabel->setText(formatTime(position));
+        m_lastUIUpdate = currentTime;
+    }
+
+    // Reduce logging frequency significantly - only for debugging
     static qint64 lastLoggedPosition = -1;
-    if (abs(position - lastLoggedPosition) > 1000)
-    { // Log every second
-        LOG_TRACE("Position changed to: {}ms ({})", position, formatTime(position).toStdString());
+    if (abs(position - lastLoggedPosition) > 10000)
+    { // Log every 10 seconds to minimize overhead
+        LOG_DEBUG("Position: {}ms", position);
         lastLoggedPosition = position;
     }
 }
@@ -712,8 +735,8 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
 
                 previousFrame();
                 m_isSteppingBackward = true;
-                m_stepInterval = 100;         // Start with 100ms interval
-                m_frameStepTimer->start(300); // Initial delay before rapid stepping
+                m_stepInterval = 200;         // Increased from 150ms to 200ms for more conservative stepping
+                m_frameStepTimer->start(500); // Increased initial delay from 400ms to 500ms
                 LOG_DEBUG("Started backward frame stepping");
             }
             event->accept();
@@ -744,8 +767,8 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
 
                 nextFrame();
                 m_isSteppingForward = true;
-                m_stepInterval = 100;         // Start with 100ms interval
-                m_frameStepTimer->start(300); // Initial delay before rapid stepping
+                m_stepInterval = 200;         // Increased from 150ms to 200ms for more conservative stepping
+                m_frameStepTimer->start(500); // Increased initial delay from 400ms to 500ms
                 LOG_DEBUG("Started forward frame stepping");
             }
             event->accept();
@@ -788,7 +811,7 @@ void MainWindow::keyReleaseEvent(QKeyEvent *event)
             LOG_DEBUG("Left arrow key released - stopping backward frame stepping");
             m_frameStepTimer->stop();
             m_isSteppingBackward = false;
-            m_stepInterval = 100; // Reset interval for next time
+            m_stepInterval = 200; // Reset interval for next time
             event->accept();
             return;
         }
@@ -800,7 +823,7 @@ void MainWindow::keyReleaseEvent(QKeyEvent *event)
             LOG_DEBUG("Right arrow key released - stopping forward frame stepping");
             m_frameStepTimer->stop();
             m_isSteppingForward = false;
-            m_stepInterval = 100; // Reset interval for next time
+            m_stepInterval = 200; // Reset interval for next time
             event->accept();
             return;
         }
@@ -832,26 +855,22 @@ void MainWindow::onFrameStepTimer()
 {
     if (m_isSteppingForward)
     {
-        LOG_TRACE("Frame step timer - stepping forward (interval: {}ms)", m_stepInterval);
         nextFrame();
-        // Accelerate stepping - reduce interval to minimum of 20ms
-        if (m_stepInterval > 20)
+        // More conservative acceleration - minimum interval of 100ms (increased from 50ms)
+        if (m_stepInterval > 100)
         {
-            m_stepInterval = qMax(20, m_stepInterval - 10);
+            m_stepInterval = qMax(100, m_stepInterval - 10); // Slower acceleration
             m_frameStepTimer->setInterval(m_stepInterval);
-            LOG_TRACE("Accelerated stepping interval to {}ms", m_stepInterval);
         }
     }
     else if (m_isSteppingBackward)
     {
-        LOG_TRACE("Frame step timer - stepping backward (interval: {}ms)", m_stepInterval);
         previousFrame();
-        // Accelerate stepping - reduce interval to minimum of 20ms
-        if (m_stepInterval > 20)
+        // More conservative acceleration - minimum interval of 100ms (increased from 50ms)
+        if (m_stepInterval > 100)
         {
-            m_stepInterval = qMax(20, m_stepInterval - 10);
+            m_stepInterval = qMax(100, m_stepInterval - 10); // Slower acceleration
             m_frameStepTimer->setInterval(m_stepInterval);
-            LOG_TRACE("Accelerated stepping interval to {}ms", m_stepInterval);
         }
     }
     else
@@ -1026,7 +1045,43 @@ void MainWindow::captureCurrentFrame()
         return;
     }
 
-    LOG_INFO("Attempting to capture current frame");
+    LOG_INFO("Attempting to capture current frame using method: {}",
+             m_frameCaptureMethod == CAPTURE_FFMPEG ? "FFmpeg" : "Qt Sink");
+
+    switch (m_frameCaptureMethod)
+    {
+    case CAPTURE_FFMPEG:
+        captureCurrentFrameFFmpeg();
+        break;
+    case CAPTURE_QT_SINK:
+    default:
+        captureCurrentFrameQt();
+        break;
+    }
+}
+
+void MainWindow::onFrameAvailable()
+{
+    // This slot is called when a new frame is available from the FrameCaptureSink
+    // It's currently just a notification - the actual frame access happens in captureCurrentFrame()
+    // We could use this for real-time frame processing if needed
+}
+
+bool MainWindow::checkFFmpegAvailable()
+{
+    QProcess process;
+    process.start("ffmpeg", QStringList() << "-version");
+    process.waitForFinished(3000); // 3 second timeout
+
+    bool available = (process.exitCode() == 0);
+    LOG_INFO("FFmpeg availability check: {}", available ? "found" : "not found");
+
+    return available;
+}
+
+void MainWindow::captureCurrentFrameQt()
+{
+    LOG_INFO("Using Qt sink capture method");
 
     // Generate filename with current prefix
     QString filename = generateFrameFilename();
@@ -1043,7 +1098,8 @@ void MainWindow::captureCurrentFrame()
         if (currentFrame.isValid())
         {
             LOG_INFO("Capturing frame from video sink, size: {}x{}, format: {}",
-                     currentFrame.size().width(), currentFrame.size().height(), (int)currentFrame.pixelFormat());
+                     currentFrame.size().width(), currentFrame.size().height(),
+                     (int)currentFrame.pixelFormat());
 
             // Convert QVideoFrame to QImage
             QVideoFrame mappedFrame = currentFrame;
@@ -1080,7 +1136,7 @@ void MainWindow::captureCurrentFrame()
     // Fallback to placeholder if frame capture failed
     if (framePixmap.isNull())
     {
-        LOG_INFO("Using placeholder image - video frame capture failed");
+        LOG_INFO("Using placeholder image - Qt frame capture failed");
         framePixmap = QPixmap(800, 600);
         framePixmap.fill(Qt::darkGray);
 
@@ -1088,7 +1144,7 @@ void MainWindow::captureCurrentFrame()
         painter.setPen(Qt::white);
         painter.setFont(QFont("Arial", 16));
         painter.drawText(framePixmap.rect(), Qt::AlignCenter,
-                         QString("Frame capture failed\nPosition: %1ms\nTry playing the video first")
+                         QString("Qt Frame capture failed\nPosition: %1ms\nTry playing the video first")
                              .arg(m_mediaPlayer->position()));
     }
 
@@ -1109,9 +1165,70 @@ void MainWindow::captureCurrentFrame()
     }
 }
 
-void MainWindow::onFrameAvailable()
+void MainWindow::captureCurrentFrameFFmpeg()
 {
-    // This slot is called when a new frame is available from the FrameCaptureSink
-    // It's currently just a notification - the actual frame access happens in captureCurrentFrame()
-    // We could use this for real-time frame processing if needed
+    LOG_INFO("Using FFmpeg capture method");
+
+    if (m_currentVideoPath.isEmpty())
+    {
+        LOG_ERROR("No video path available for FFmpeg capture");
+        return;
+    }
+
+    // Generate filename with current prefix
+    QString filename = generateFrameFilename();
+    QString fullPath = QDir(m_outputDirectory).absoluteFilePath(filename);
+
+    // Get current position in seconds for ffmpeg
+    double currentSeconds = m_mediaPlayer->position() / 1000.0;
+
+    // Create ffmpeg command to extract frame at current position
+    QStringList arguments;
+    arguments << "-ss" << QString::number(currentSeconds, 'f', 3) // Seek to position
+              << "-i" << m_currentVideoPath                       // Input file
+              << "-frames:v" << "1"                               // Extract 1 frame
+              << "-q:v" << "2"                                    // High quality
+              << "-y"                                             // Overwrite output
+              << fullPath;                                        // Output file
+
+    LOG_INFO("FFmpeg command: ffmpeg {}", arguments.join(" ").toStdString());
+
+    // Run ffmpeg in background thread
+    QProcess *ffmpegProcess = new QProcess(this);
+
+    // Handle completion
+    connect(ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            [this, ffmpegProcess, filename, fullPath](int exitCode, QProcess::ExitStatus exitStatus)
+            {
+                ffmpegProcess->deleteLater();
+
+                if (exitCode == 0 && exitStatus == QProcess::NormalExit)
+                {
+                    LOG_INFO("FFmpeg frame saved to: {}", fullPath.toStdString());
+
+                    // Add to frame list using just the filename (without extension for display)
+                    QFileInfo fileInfo(filename);
+                    addFrameToList(fileInfo.baseName(), m_mediaPlayer->position());
+
+                    statusBar()->showMessage(QString("Frame saved: %1").arg(filename), 3000);
+                }
+                else
+                {
+                    QString errorOutput = ffmpegProcess->readAllStandardError();
+                    LOG_ERROR("FFmpeg failed with exit code {}: {}", exitCode, errorOutput.toStdString());
+                    statusBar()->showMessage("FFmpeg frame capture failed", 3000);
+                }
+            });
+
+    // Handle errors
+    connect(ffmpegProcess, &QProcess::errorOccurred,
+            [this, ffmpegProcess](QProcess::ProcessError error)
+            {
+                ffmpegProcess->deleteLater();
+                LOG_ERROR("FFmpeg process error: {}", (int)error);
+                statusBar()->showMessage("FFmpeg process error", 3000);
+            });
+
+    statusBar()->showMessage("Capturing frame with FFmpeg...", 1000);
+    ffmpegProcess->start("ffmpeg", arguments);
 }
