@@ -14,6 +14,7 @@
 #include <QFont>
 #include <QTime>
 #include <QProcess>
+#include <QRegularExpression>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(200), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr), m_frameCaptureMethod(CAPTURE_QT_SINK), m_ffmpegAvailable(false), m_lastPositionUpdate(0), m_lastUIUpdate(0)
@@ -48,6 +49,21 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Create output directory if it doesn't exist
     QDir().mkpath(m_outputDirectory);
+
+    // Auto-load last opened video if it exists
+    if (!m_lastVideoPath.isEmpty() && QFileInfo::exists(m_lastVideoPath))
+    {
+        LOG_INFO("Auto-loading last video: {}", m_lastVideoPath.toStdString());
+        // Use a timer to load the video after the UI is fully initialized
+        QTimer::singleShot(100, [this]()
+                           {
+            m_currentVideoPath = m_lastVideoPath;
+            setDefaultFilenamePrefix(m_lastVideoPath);
+            m_mediaPlayer->setVideoOutput(m_videoDisplay);
+            m_mediaPlayer->setSource(QUrl::fromLocalFile(m_lastVideoPath));
+            statusBar()->showMessage("Auto-loaded: " + QFileInfo(m_lastVideoPath).fileName(), 3000);
+            updateControls(); });
+    }
 
     setWindowTitle("Image Annotation Picker");
     resize(1200, 800);
@@ -89,9 +105,20 @@ void MainWindow::setupUI()
     m_mediaPlayer = new QMediaPlayer;
     m_mediaPlayer->setVideoOutput(m_videoDisplay);
 
+// Add performance optimizations for smoother playback
+#ifdef Q_OS_MACOS
+    // On macOS, try to reduce buffer sizes for lower latency
+    if (m_mediaPlayer->metaObject()->indexOfProperty("bufferSize") != -1)
+    {
+        m_mediaPlayer->setProperty("bufferSize", 1024 * 1024); // 1MB buffer instead of default
+    }
+#endif
+
     // Create frame capture sink for saving frames
     m_frameCaptureSink = new FrameCaptureSink(this);
-    connect(m_frameCaptureSink, &FrameCaptureSink::frameAvailable, this, &MainWindow::onFrameAvailable);
+    // NOTE: Commenting out unused signal connection that was causing UI hangups
+    // This was being called 30-60 times per second during playback with no benefit
+    // connect(m_frameCaptureSink, &FrameCaptureSink::frameAvailable, this, &MainWindow::onFrameAvailable);
     LOG_INFO("Created frame capture sink");
 
     // Connect to the video widget's sink to capture frames
@@ -205,7 +232,7 @@ void MainWindow::setupUI()
     m_filenamePrefixEdit->setMinimumWidth(150); // Make it wider
 
     // Put pattern hint on next line to save space
-    QLabel *patternHint = new QLabel("Pattern: <prefix>_<timestamp>_<width>_<height>.png");
+    QLabel *patternHint = new QLabel("Pattern: <prefix>_<timestamp>_<videoposition>ms_<width>_<height>.png");
     patternHint->setStyleSheet("color: gray; font-style: italic; font-size: 10px;");
 
     filenamePrefixLayout->addWidget(filenamePrefixLabel);
@@ -338,6 +365,27 @@ void MainWindow::connectSignals()
     connect(m_exportFramesBtn, &QPushButton::clicked, this, &MainWindow::exportSelectedFrames);
     connect(m_clearFramesBtn, &QPushButton::clicked, this, &MainWindow::clearSelectedFrames);
 
+    // Auto-update button states based on frame list changes (instead of manual updateControls calls)
+    connect(m_frameList, &QListWidget::itemSelectionChanged, [this]()
+            { m_removeFrameBtn->setEnabled(m_frameList->currentRow() >= 0); });
+    connect(m_frameList, &QListWidget::itemChanged, [this]()
+            {
+        bool hasFrames = m_frameList->count() > 0;
+        m_exportFramesBtn->setEnabled(hasFrames);
+        m_clearFramesBtn->setEnabled(hasFrames); });
+    // Also handle when items are added/removed programmatically
+    connect(m_frameList->model(), &QAbstractItemModel::rowsInserted, [this]()
+            {
+        bool hasFrames = m_frameList->count() > 0;
+        m_exportFramesBtn->setEnabled(hasFrames);
+        m_clearFramesBtn->setEnabled(hasFrames); });
+    connect(m_frameList->model(), &QAbstractItemModel::rowsRemoved, [this]()
+            {
+        bool hasFrames = m_frameList->count() > 0;
+        m_exportFramesBtn->setEnabled(hasFrames);
+        m_clearFramesBtn->setEnabled(hasFrames);
+        m_removeFrameBtn->setEnabled(m_frameList->currentRow() >= 0); });
+
     // Settings
     connect(m_browseDirBtn, &QPushButton::clicked, [this]()
             {
@@ -348,6 +396,9 @@ void MainWindow::connectSignals()
 
             // Save settings immediately when directory changes
             saveSettings();
+
+            // Scan for existing frames when directory changes
+            scanForExistingFrames();
 
             LOG_INFO("Output directory changed to: {}", dir.toStdString());
         } });
@@ -366,6 +417,7 @@ void MainWindow::connectSignals()
 
 void MainWindow::updateControls()
 {
+    // Only called when necessary (video load/unload) - no need for frequent performance logging
     bool hasVideo = !m_currentVideoPath.isEmpty();
     bool canSeek = hasVideo && m_videoDuration > 0;
 
@@ -375,6 +427,7 @@ void MainWindow::updateControls()
     m_saveFrameBtn->setEnabled(hasVideo);
     m_positionSlider->setEnabled(canSeek);
 
+    // Frame list button states are now handled automatically by signal connections
     m_removeFrameBtn->setEnabled(m_frameList->currentRow() >= 0);
     m_exportFramesBtn->setEnabled(m_frameList->count() > 0);
     m_clearFramesBtn->setEnabled(m_frameList->count() > 0);
@@ -418,6 +471,9 @@ void MainWindow::openVideo()
 
 void MainWindow::saveCurrentFrame()
 {
+    qint64 saveStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("💾 SAVE: saveCurrentFrame() START");
+
     if (m_currentVideoPath.isEmpty())
     {
         QMessageBox::warning(this, "Warning", "No video loaded.");
@@ -426,34 +482,59 @@ void MainWindow::saveCurrentFrame()
 
     // Use the new frame capture implementation
     captureCurrentFrame();
+
+    qint64 duration = QDateTime::currentMSecsSinceEpoch() - saveStart;
+    if (duration > 5)
+    {
+        LOG_WARN("💾 SAVE: saveCurrentFrame() took {}ms (may cause UI lag)", duration);
+    }
+    else
+    {
+        LOG_TRACE("💾 SAVE: saveCurrentFrame() completed in {}ms", duration);
+    }
 }
 
 void MainWindow::playPause()
 {
-    LOG_DEBUG("playPause() called - current state: {}", m_isPlaying ? "playing" : "paused");
+    qint64 playPauseStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("⏯️ PLAY: playPause() START - current state: {}", m_isPlaying ? "playing" : "paused");
 
     if (m_isPlaying)
     {
         m_mediaPlayer->pause();
         m_playPauseBtn->setText("Play");
         m_isPlaying = false;
-        LOG_INFO("Video paused");
+        LOG_INFO("⏸️ Video paused");
     }
     else
     {
         m_mediaPlayer->play();
         m_playPauseBtn->setText("Pause");
         m_isPlaying = true;
-        LOG_INFO("Video playing");
+        LOG_INFO("▶️ Video playing");
+    }
+
+    qint64 duration = QDateTime::currentMSecsSinceEpoch() - playPauseStart;
+    if (duration > 2)
+    {
+        LOG_WARN("⏯️ PLAY: playPause() took {}ms (may cause UI lag)", duration);
+    }
+    else
+    {
+        LOG_TRACE("⏯️ PLAY: playPause() completed in {}ms", duration);
     }
 }
 
 void MainWindow::nextFrame()
 {
+    qint64 frameStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("➡️ FRAME: nextFrame() called");
+
     // Throttle position updates to avoid overwhelming the media player
     qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
     if (currentTime - m_lastPositionUpdate < 30)
     { // Minimum 30ms between updates
+        LOG_TRACE("➡️ FRAME: Throttled - only {}ms since last update", currentTime - m_lastPositionUpdate);
         return;
     }
     m_lastPositionUpdate = currentTime;
@@ -468,20 +549,32 @@ void MainWindow::nextFrame()
     static qint64 lastLogTime = 0;
     if (currentTime - lastLogTime > 500)
     { // Log every 500ms max
-        LOG_DEBUG("nextFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+        LOG_DEBUG("➡️ FRAME: nextFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
         lastLogTime = currentTime;
     }
 
     // Direct position update without additional timers
+    LOG_TRACE("➡️ FRAME: Setting media player position to {}ms", newPos);
     m_mediaPlayer->setPosition(newPos);
+
+    qint64 frameEnd = QDateTime::currentMSecsSinceEpoch();
+    qint64 duration = frameEnd - frameStart;
+    if (duration > 3) // Log if frame operation takes more than 3ms
+    {
+        LOG_WARN("➡️ FRAME: nextFrame() took {}ms (may cause UI hangup)", duration);
+    }
 }
 
 void MainWindow::previousFrame()
 {
+    qint64 frameStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("⬅️ FRAME: previousFrame() called");
+
     // Throttle position updates to avoid overwhelming the media player
     qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
     if (currentTime - m_lastPositionUpdate < 30)
     { // Minimum 30ms between updates
+        LOG_TRACE("⬅️ FRAME: Throttled - only {}ms since last update", currentTime - m_lastPositionUpdate);
         return;
     }
     m_lastPositionUpdate = currentTime;
@@ -495,62 +588,93 @@ void MainWindow::previousFrame()
     static qint64 lastLogTime = 0;
     if (currentTime - lastLogTime > 500)
     { // Log every 500ms max
-        LOG_DEBUG("previousFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
+        LOG_DEBUG("⬅️ FRAME: previousFrame() - current: {}ms, frameTime: {}ms, new: {}ms", currentPos, frameTime, newPos);
         lastLogTime = currentTime;
     }
 
     // Direct position update without additional timers
+    LOG_TRACE("⬅️ FRAME: Setting media player position to {}ms", newPos);
     m_mediaPlayer->setPosition(newPos);
+
+    qint64 frameEnd = QDateTime::currentMSecsSinceEpoch();
+    qint64 duration = frameEnd - frameStart;
+    if (duration > 3) // Log if frame operation takes more than 3ms
+    {
+        LOG_WARN("⬅️ FRAME: previousFrame() took {}ms (may cause UI hangup)", duration);
+    }
 }
 
 void MainWindow::seekToPosition(int position)
 {
-    LOG_DEBUG("seekToPosition called with position: {}ms", position);
+    qint64 seekStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("🎯 SEEK: seekToPosition() START - position: {}ms", position);
+
     m_mediaPlayer->setPosition(position);
 
     // Ensure main window gets focus back after slider interaction
     setFocus();
+
+    qint64 duration = QDateTime::currentMSecsSinceEpoch() - seekStart;
+    if (duration > 3)
+    {
+        LOG_WARN("🎯 SEEK: seekToPosition() took {}ms (may cause UI stutter)", duration);
+    }
+    else
+    {
+        LOG_TRACE("🎯 SEEK: seekToPosition() completed in {}ms", duration);
+    }
 }
 
 void MainWindow::onPositionChanged(qint64 position)
 {
-    // Throttle UI updates to reduce overhead - only update every 100ms
+    // Throttle UI updates to reduce overhead - only update every 300ms (was 200ms)
     qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
-    bool shouldUpdateUI = (currentTime - m_lastUIUpdate > 100);
+    bool shouldUpdateUI = (currentTime - m_lastUIUpdate > 300);
 
-    // Always update slider position if not being dragged (this is lightweight)
-    if (!m_positionSlider->isSliderDown())
+    // Update slider position less frequently to reduce UI overhead
+    if (shouldUpdateUI && !m_positionSlider->isSliderDown())
     {
         m_positionSlider->setValue(static_cast<int>(position));
-    }
-
-    // Only update time label periodically to reduce UI overhead
-    if (shouldUpdateUI)
-    {
         m_timeLabel->setText(formatTime(position));
         m_lastUIUpdate = currentTime;
     }
 
-    // Reduce logging frequency significantly - only for debugging
+    // Minimal logging to avoid overhead - only log every 10 seconds
     static qint64 lastLoggedPosition = -1;
     if (abs(position - lastLoggedPosition) > 10000)
-    { // Log every 10 seconds to minimize overhead
-        LOG_DEBUG("Position: {}ms", position);
+    {
+        LOG_DEBUG("📡 POSITION: {}ms", position);
         lastLoggedPosition = position;
     }
 }
 
 void MainWindow::onDurationChanged(qint64 duration)
 {
-    LOG_INFO("Video duration: {}ms ({})", duration, formatTime(duration).toStdString());
+    qint64 durationStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("⏱️ DURATION: onDurationChanged() START - duration: {}ms ({})", duration, formatTime(duration).toStdString());
+
     m_videoDuration = duration;
     m_positionSlider->setRange(0, static_cast<int>(duration));
     m_durationLabel->setText(formatTime(duration));
+    // Update controls when duration is set - this enables frame navigation buttons
     updateControls();
+
+    qint64 durationEnd = QDateTime::currentMSecsSinceEpoch();
+    qint64 elapsed = durationEnd - durationStart;
+    if (elapsed > 3)
+    {
+        LOG_WARN("⏱️ DURATION: onDurationChanged() took {}ms (may cause UI lag)", elapsed);
+    }
+    else
+    {
+        LOG_TRACE("⏱️ DURATION: onDurationChanged() completed in {}ms", elapsed);
+    }
 }
 
 void MainWindow::onMediaStatusChanged(QMediaPlayer::MediaStatus status)
 {
+    qint64 statusStart = QDateTime::currentMSecsSinceEpoch();
+
     QString statusStr;
     switch (status)
     {
@@ -583,7 +707,7 @@ void MainWindow::onMediaStatusChanged(QMediaPlayer::MediaStatus status)
         break;
     }
 
-    LOG_INFO("Media status changed to: {}", statusStr.toStdString());
+    LOG_INFO("🎬 MEDIA: Status changed to: {}", statusStr.toStdString());
 
     switch (status)
     {
@@ -591,6 +715,8 @@ void MainWindow::onMediaStatusChanged(QMediaPlayer::MediaStatus status)
         statusBar()->showMessage("Video loaded successfully", 2000);
         // Ensure main window has focus for keyboard events
         setFocus();
+        // Scan for existing frames when video is loaded
+        scanForExistingFrames();
         break;
     case QMediaPlayer::InvalidMedia:
         statusBar()->showMessage("Invalid media file", 3000);
@@ -644,7 +770,7 @@ void MainWindow::removeSelectedFrame()
     {
         delete m_frameList->takeItem(currentRow);
         m_frameCountLabel->setText(QString("Frames: %1").arg(m_frameList->count()));
-        updateControls();
+        // NOTE: Removed updateControls() - the rowsRemoved signal will handle this automatically
     }
 }
 
@@ -682,7 +808,7 @@ void MainWindow::clearSelectedFrames()
         {
             m_frameList->clear();
             m_frameCountLabel->setText("Frames: 0");
-            updateControls();
+            // NOTE: Removed updateControls() - the rowsRemoved signal will handle this automatically
         }
     }
 }
@@ -699,12 +825,14 @@ void MainWindow::addFrameToList(const QString &framePath, qint64 timestamp)
 
     m_frameList->addItem(item);
     m_frameCountLabel->setText(QString("Frames: %1").arg(m_frameList->count()));
-    updateControls();
+    // NOTE: Removed updateControls() - frame list changes don't affect media controls, only list-specific buttons
+    // The list selection change signal will handle enabling/disabling remove button automatically
 }
 
 void MainWindow::keyPressEvent(QKeyEvent *event)
 {
-    LOG_DEBUG("Key press event: key={}, modifiers={}, repeat={}", event->key(), event->modifiers(), event->isAutoRepeat());
+    qint64 keyStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("⌨️ KEY: keyPressEvent() START - key={}, modifiers={}, repeat={}", event->key(), event->modifiers(), event->isAutoRepeat());
 
     if (!m_currentVideoPath.isEmpty() && m_videoDuration > 0)
     {
@@ -796,6 +924,16 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
         LOG_DEBUG("Key event ignored - no video loaded or invalid duration");
     }
 
+    qint64 duration = QDateTime::currentMSecsSinceEpoch() - keyStart;
+    if (duration > 2)
+    {
+        LOG_WARN("⌨️ KEY: keyPressEvent() took {}ms (may cause UI lag)", duration);
+    }
+    else
+    {
+        LOG_TRACE("⌨️ KEY: keyPressEvent() completed in {}ms", duration);
+    }
+
     QMainWindow::keyPressEvent(event);
 }
 
@@ -853,30 +991,49 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
 void MainWindow::onFrameStepTimer()
 {
+    qint64 timerStart = QDateTime::currentMSecsSinceEpoch();
+    LOG_TRACE("⏰ TIMER: onFrameStepTimer() START - forward: {}, backward: {}, interval: {}ms",
+              m_isSteppingForward, m_isSteppingBackward, m_stepInterval);
+
     if (m_isSteppingForward)
     {
+        LOG_TRACE("⏰ TIMER: Calling nextFrame() from timer");
         nextFrame();
         // More conservative acceleration - minimum interval of 100ms (increased from 50ms)
         if (m_stepInterval > 100)
         {
             m_stepInterval = qMax(100, m_stepInterval - 10); // Slower acceleration
             m_frameStepTimer->setInterval(m_stepInterval);
+            LOG_TRACE("⏰ TIMER: Accelerated stepping interval to {}ms", m_stepInterval);
         }
     }
     else if (m_isSteppingBackward)
     {
+        LOG_TRACE("⏰ TIMER: Calling previousFrame() from timer");
         previousFrame();
         // More conservative acceleration - minimum interval of 100ms (increased from 50ms)
         if (m_stepInterval > 100)
         {
             m_stepInterval = qMax(100, m_stepInterval - 10); // Slower acceleration
             m_frameStepTimer->setInterval(m_stepInterval);
+            LOG_TRACE("⏰ TIMER: Accelerated stepping interval to {}ms", m_stepInterval);
         }
     }
     else
     {
-        LOG_DEBUG("Frame step timer - stopping (no active stepping)");
+        LOG_DEBUG("⏰ TIMER: Frame step timer - stopping (no active stepping)");
         m_frameStepTimer->stop();
+    }
+
+    qint64 timerEnd = QDateTime::currentMSecsSinceEpoch();
+    qint64 duration = timerEnd - timerStart;
+    if (duration > 5) // Log if timer takes more than 5ms
+    {
+        LOG_WARN("⏰ TIMER: onFrameStepTimer() took {}ms (may cause UI hangup)", duration);
+    }
+    else
+    {
+        LOG_TRACE("⏰ TIMER: onFrameStepTimer() completed in {}ms", duration);
     }
 }
 
@@ -1015,7 +1172,10 @@ QString MainWindow::generateFrameFilename()
         }
     }
 
-    // Get current timestamp
+    // Get current video position in milliseconds
+    qint64 videoPosition = m_mediaPlayer ? m_mediaPlayer->position() : 0;
+
+    // Get current timestamp for uniqueness
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
 
     // Get video size if available - fallback to default size for filename
@@ -1029,10 +1189,12 @@ QString MainWindow::generateFrameFilename()
         }
     }
 
-    // Generate filename: prefix_timestamp_width_height.png
-    return QString("%1_%2_%3_%4.png")
+    // Generate filename: prefix_timestamp_videoposition_width_height.png
+    // This allows us to extract the video position later for timeline marking
+    return QString("%1_%2_%3ms_%4_%5.png")
         .arg(prefix)
         .arg(timestamp)
+        .arg(videoPosition)
         .arg(videoSize.width())
         .arg(videoSize.height());
 }
@@ -1060,12 +1222,16 @@ void MainWindow::captureCurrentFrame()
     }
 }
 
+// NOTE: Commenting out unused slot that was causing UI hangups
+// This was being called 30-60 times per second during playback with no benefit
+/*
 void MainWindow::onFrameAvailable()
 {
     // This slot is called when a new frame is available from the FrameCaptureSink
     // It's currently just a notification - the actual frame access happens in captureCurrentFrame()
     // We could use this for real-time frame processing if needed
 }
+*/
 
 bool MainWindow::checkFFmpegAvailable()
 {
@@ -1231,4 +1397,221 @@ void MainWindow::captureCurrentFrameFFmpeg()
 
     statusBar()->showMessage("Capturing frame with FFmpeg...", 1000);
     ffmpegProcess->start("ffmpeg", arguments);
+}
+
+void MainWindow::scanForExistingFrames()
+{
+    if (m_currentVideoPath.isEmpty() || m_outputDirectory.isEmpty())
+    {
+        LOG_DEBUG("Cannot scan for existing frames: no video or output directory");
+        return;
+    }
+
+    LOG_INFO("Scanning for existing frames in: {}", m_outputDirectory.toStdString());
+
+    m_existingFrameTimestamps = parseExistingFrameTimestamps();
+
+    LOG_INFO("Found {} existing frame(s)", m_existingFrameTimestamps.size());
+
+    // Update timeline markers
+    updateTimelineMarkers();
+}
+
+QList<qint64> MainWindow::parseExistingFrameTimestamps()
+{
+    QList<qint64> timestamps;
+    QDir outputDir(m_outputDirectory);
+
+    if (!outputDir.exists())
+    {
+        LOG_DEBUG("Output directory doesn't exist: {}", m_outputDirectory.toStdString());
+        return timestamps;
+    }
+
+    // Get current filename prefix
+    QString currentPrefix = "frame";
+    if (m_filenamePrefixEdit)
+    {
+        QString userPrefix = m_filenamePrefixEdit->text().trimmed();
+        if (!userPrefix.isEmpty())
+        {
+            currentPrefix = userPrefix;
+        }
+    }
+
+    // Create regex pattern to match our NEW filename format:
+    // prefix_YYYYMMDD_hhmmss_zzz_XXXXms_width_height.ext
+    QString pattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)ms_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+                          .arg(QRegularExpression::escape(currentPrefix));
+    QRegularExpression newFormatRegex(pattern, QRegularExpression::CaseInsensitiveOption);
+
+    // Also support OLD filename format for backward compatibility:
+    // prefix_YYYYMMDD_hhmmss_zzz_width_height.ext
+    QString oldPattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+                             .arg(QRegularExpression::escape(currentPrefix));
+    QRegularExpression oldFormatRegex(oldPattern, QRegularExpression::CaseInsensitiveOption);
+
+    // Get all image files in directory
+    QStringList nameFilters;
+    nameFilters << "*.png" << "*.jpg" << "*.jpeg" << "*.bmp" << "*.tiff";
+    QFileInfoList files = outputDir.entryInfoList(nameFilters, QDir::Files);
+
+    LOG_INFO("Scanning directory: {}", m_outputDirectory.toStdString());
+    LOG_INFO("Using prefix: '{}'", currentPrefix.toStdString());
+    LOG_INFO("Found {} image files total", files.size());
+    LOG_DEBUG("New pattern: {}", pattern.toStdString());
+    LOG_DEBUG("Old pattern: {}", oldPattern.toStdString());
+
+    // List all files for debugging
+    for (const QFileInfo &fileInfo : files)
+    {
+        LOG_DEBUG("File found: {}", fileInfo.fileName().toStdString());
+    }
+
+    for (const QFileInfo &fileInfo : files)
+    {
+        QString filename = fileInfo.fileName();
+        LOG_DEBUG("Processing file: {}", filename.toStdString());
+
+        qint64 timestamp = extractTimestampFromFilename(filename);
+
+        if (timestamp >= 0)
+        {
+            timestamps.append(timestamp);
+            LOG_INFO("✓ Found existing frame: {} -> {}ms", filename.toStdString(), timestamp);
+        }
+        else
+        {
+            LOG_DEBUG("✗ Skipped file (no timestamp): {}", filename.toStdString());
+        }
+    }
+
+    // Sort timestamps
+    std::sort(timestamps.begin(), timestamps.end());
+
+    return timestamps;
+}
+
+qint64 MainWindow::extractTimestampFromFilename(const QString &filename)
+{
+    // Get current filename prefix
+    QString currentPrefix = "frame";
+    if (m_filenamePrefixEdit)
+    {
+        QString userPrefix = m_filenamePrefixEdit->text().trimmed();
+        if (!userPrefix.isEmpty())
+        {
+            currentPrefix = userPrefix;
+        }
+    }
+
+    LOG_DEBUG("Extracting timestamp from: '{}' with prefix: '{}'", filename.toStdString(), currentPrefix.toStdString());
+
+    // Try NEW filename format first: prefix_YYYYMMDD_hhmmss_zzz_XXXXms_width_height.ext
+    QString newPattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)ms_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+                             .arg(QRegularExpression::escape(currentPrefix));
+    QRegularExpression newFormatRegex(newPattern, QRegularExpression::CaseInsensitiveOption);
+    QRegularExpressionMatch newMatch = newFormatRegex.match(filename);
+
+    LOG_DEBUG("Testing new format pattern: {}", newPattern.toStdString());
+
+    if (newMatch.hasMatch())
+    {
+        // Extract video position from the new format
+        qint64 videoPosition = newMatch.captured(4).toLongLong();
+        LOG_INFO("✓ Extracted video position from new format: {}ms", videoPosition);
+        return videoPosition;
+    }
+    else
+    {
+        LOG_DEBUG("✗ New format pattern didn't match");
+    }
+
+    // Try OLD filename format for backward compatibility: prefix_YYYYMMDD_hhmmss_zzz_width_height.ext
+    QString oldPattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+                             .arg(QRegularExpression::escape(currentPrefix));
+    QRegularExpression oldFormatRegex(oldPattern, QRegularExpression::CaseInsensitiveOption);
+    QRegularExpressionMatch oldMatch = oldFormatRegex.match(filename);
+
+    LOG_DEBUG("Testing old format pattern: {}", oldPattern.toStdString());
+
+    if (oldMatch.hasMatch())
+    {
+        LOG_INFO("✓ Found old format file (no video position): {}", filename.toStdString());
+        // For old format files, we can't extract video position, so skip them
+        return -1;
+    }
+    else
+    {
+        LOG_DEBUG("✗ Old format pattern didn't match either");
+    }
+
+    LOG_DEBUG("✗ Filename doesn't match any expected pattern: {}", filename.toStdString());
+    return -1;
+}
+
+void MainWindow::updateTimelineMarkers()
+{
+    if (!m_positionSlider || m_videoDuration <= 0)
+    {
+        LOG_DEBUG("Cannot update timeline markers: invalid slider or duration");
+        return;
+    }
+
+    if (m_existingFrameTimestamps.isEmpty())
+    {
+        LOG_DEBUG("No existing frame timestamps to mark on timeline");
+        // Reset to default slider style
+        m_positionSlider->setStyleSheet("");
+        return;
+    }
+
+    LOG_INFO("Marking {} existing frames on timeline", m_existingFrameTimestamps.size());
+
+    // Create a simple stylesheet that adds visual indicators
+    // We'll use a custom background with gradient stops at frame positions
+    QString styleSheet = "QSlider::groove:horizontal {"
+                         "border: 1px solid #999999;"
+                         "height: 8px;"
+                         "background: qlineargradient(x1:0, y1:0, x2:1, y2:0";
+
+    // Add gradient stops for existing frames
+    for (int i = 0; i < m_existingFrameTimestamps.size(); ++i)
+    {
+        qint64 timestamp = m_existingFrameTimestamps[i];
+        double position = static_cast<double>(timestamp) / static_cast<double>(m_videoDuration);
+
+        // Clamp position to valid range
+        position = qMax(0.0, qMin(1.0, position));
+
+        // Add a red marker at this position
+        styleSheet += QString(", stop:%1 #ff4444").arg(position, 0, 'f', 4);
+
+        // Add a small range around the marker
+        if (position > 0.002)
+        {
+            styleSheet += QString(", stop:%1 #cccccc").arg(position - 0.002, 0, 'f', 4);
+        }
+        if (position < 0.998)
+        {
+            styleSheet += QString(", stop:%1 #cccccc").arg(position + 0.002, 0, 'f', 4);
+        }
+    }
+
+    styleSheet += ");"
+                  "border-radius: 4px;"
+                  "}"
+                  "QSlider::handle:horizontal {"
+                  "background: #0078d4;"
+                  "border: 1px solid #0078d4;"
+                  "width: 14px;"
+                  "margin: -3px 0;"
+                  "border-radius: 7px;"
+                  "}";
+
+    m_positionSlider->setStyleSheet(styleSheet);
+
+    // Update status bar to show frame count
+    QString message = QString("Found %1 existing frame(s) at various positions").arg(m_existingFrameTimestamps.size());
+    statusBar()->showMessage(message, 3000);
 }

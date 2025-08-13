@@ -56,7 +56,8 @@ private slots:
     void exportSelectedFrames();
     void clearSelectedFrames();
     void onFrameStepTimer();
-    void onFrameAvailable();
+    // NOTE: Commented out unused slot that was causing UI hangups
+    // void onFrameAvailable();
 
 protected:
     void keyPressEvent(QKeyEvent *event) override;
@@ -88,6 +89,12 @@ private:
     void captureCurrentFrameQt();
     void captureCurrentFrameFFmpeg();
     bool checkFFmpegAvailable();
+
+    // Existing frame detection and timeline marking
+    void scanForExistingFrames();
+    void updateTimelineMarkers();
+    QList<qint64> parseExistingFrameTimestamps();
+    qint64 extractTimestampFromFilename(const QString &filename);
 
     // UI Components
     QWidget *m_centralWidget;
@@ -152,6 +159,9 @@ private:
     // Frame capture configuration
     FrameCaptureMethod m_frameCaptureMethod;
     bool m_ffmpegAvailable;
+
+    // Existing frame timeline markers
+    QList<qint64> m_existingFrameTimestamps;
 
     // Position update throttling
     qint64 m_lastPositionUpdate;

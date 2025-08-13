@@ -32,8 +32,9 @@ public slots:
 signals:
     /**
      * Signal emitted when a new frame becomes available
+     * NOTE: Commented out to prevent UI hangups - was emitted 30-60 times per second
      */
-    void frameAvailable();
+    // void frameAvailable();
 
 private:
     QVideoFrame m_currentFrame;
