@@ -1249,14 +1249,12 @@ QString MainWindow::generateFrameFilename()
     // Get current video position in milliseconds
     qint64 videoPosition = m_mediaPlayer ? m_mediaPlayer->position() : 0;
 
-    // Convert position to seconds for presentation timestamp
-    qint64 presentationTimestamp = videoPosition / 1000;
-
-    // Generate filename: {prefix}_{presentationtimestamp}.png
-    // This allows us to extract the video position later for timeline marking
+    // Use millisecond precision instead of seconds for better uniqueness
+    // Format: {prefix}_{milliseconds}.png
+    // This provides much better precision for frame-by-frame captures
     return QString("%1_%2.png")
         .arg(prefix)
-        .arg(presentationTimestamp);
+        .arg(videoPosition);
 }
 
 void MainWindow::captureCurrentFrame()
@@ -1567,7 +1565,7 @@ qint64 MainWindow::extractTimestampFromFilename(const QString &filename)
 
     LOG_DEBUG("Extracting timestamp from: '{}' with prefix: '{}'", filename.toStdString(), currentPrefix.toStdString());
 
-    // Try NEW simplified format: prefix_presentationtimestamp.ext
+    // Try NEW simplified format: prefix_milliseconds.ext
     QString newPattern = QString("^%1_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
                              .arg(QRegularExpression::escape(currentPrefix));
     QRegularExpression newFormatRegex(newPattern, QRegularExpression::CaseInsensitiveOption);
@@ -1577,10 +1575,9 @@ qint64 MainWindow::extractTimestampFromFilename(const QString &filename)
 
     if (newMatch.hasMatch())
     {
-        // Extract presentation timestamp (in seconds) and convert to milliseconds
-        qint64 presentationTimestamp = newMatch.captured(1).toLongLong();
-        qint64 videoPosition = presentationTimestamp * 1000; // Convert to milliseconds
-        LOG_INFO("✓ Extracted presentation timestamp from new format: {}s ({}ms)", presentationTimestamp, videoPosition);
+        // Extract video position in milliseconds directly
+        qint64 videoPosition = newMatch.captured(1).toLongLong();
+        LOG_INFO("✓ Extracted video position from new format: {}ms", videoPosition);
         return videoPosition;
     }
     else
