@@ -17,7 +17,7 @@
 #include <QRegularExpression>
 
 MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(200), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr), m_frameCaptureMethod(CAPTURE_QT_SINK), m_ffmpegAvailable(false), m_lastPositionUpdate(0), m_lastUIUpdate(0)
+    : QMainWindow(parent), m_centralWidget(nullptr), m_mainSplitter(nullptr), m_videoWidget(nullptr), m_videoDisplay(nullptr), m_mediaPlayer(nullptr), m_frameCaptureSink(nullptr), m_controlsWidget(nullptr), m_playPauseBtn(nullptr), m_previousFrameBtn(nullptr), m_nextFrameBtn(nullptr), m_saveFrameBtn(nullptr), m_positionSlider(nullptr), m_timeLabel(nullptr), m_durationLabel(nullptr), m_frameListWidget(nullptr), m_frameList(nullptr), m_removeFrameBtn(nullptr), m_exportFramesBtn(nullptr), m_clearFramesBtn(nullptr), m_frameCountLabel(nullptr), m_settingsGroup(nullptr), m_outputDirEdit(nullptr), m_browseDirBtn(nullptr), m_imageFormatCombo(nullptr), m_openVideoAction(nullptr), m_exitAction(nullptr), m_aboutAction(nullptr), m_progressBar(nullptr), m_filePathLabel(nullptr), m_frameStepTimer(nullptr), m_isSteppingForward(false), m_isSteppingBackward(false), m_stepInterval(200), m_videoDuration(0), m_isPlaying(false), m_toggleFrameListBtn(nullptr), m_frameCaptureMethod(CAPTURE_QT_SINK), m_ffmpegAvailable(false), m_lastPositionUpdate(0), m_lastUIUpdate(0)
 {
     setupUI();
     setupMenuBar();
@@ -59,6 +59,7 @@ MainWindow::MainWindow(QWidget *parent)
                            {
             m_currentVideoPath = m_lastVideoPath;
             setDefaultFilenamePrefix(m_lastVideoPath);
+            updateFilePathDisplay(m_lastVideoPath);
             m_mediaPlayer->setVideoOutput(m_videoDisplay);
             m_mediaPlayer->setSource(QUrl::fromLocalFile(m_lastVideoPath));
             statusBar()->showMessage("Auto-loaded: " + QFileInfo(m_lastVideoPath).fileName(), 3000);
@@ -268,6 +269,11 @@ void MainWindow::setupUI()
     m_frameList->setFocusPolicy(Qt::NoFocus);
 
     // Status bar
+    m_filePathLabel = new QLabel("No video loaded");
+    m_filePathLabel->setMinimumWidth(200);
+    m_filePathLabel->setToolTip("Currently loaded video file");
+    statusBar()->addWidget(m_filePathLabel);
+
     m_progressBar = new QProgressBar;
     m_progressBar->setVisible(false);
     statusBar()->addPermanentWidget(m_progressBar);
@@ -454,6 +460,9 @@ void MainWindow::openVideo()
 
         // Set default filename prefix from video filename
         setDefaultFilenamePrefix(fileName);
+
+        // Update file path display
+        updateFilePathDisplay(fileName);
 
         // Set up dual output: video widget for display and video sink for frame capture
         m_mediaPlayer->setVideoOutput(m_videoDisplay);
@@ -1065,28 +1074,85 @@ QString MainWindow::extractFilenamePrefix(const QString &videoPath)
     QFileInfo fileInfo(videoPath);
     QString baseName = fileInfo.baseName(); // Gets filename without extension
 
-    // Look for first underscore to split
-    int underscoreIndex = baseName.indexOf('_');
-    if (underscoreIndex != -1)
+    // Check if it looks like a YouTube ID (11 characters followed by underscore)
+    if (baseName.length() >= 12 && baseName.at(11) == '_')
     {
-        return baseName.left(underscoreIndex);
+        QString potentialYouTubeId = baseName.left(11);
+        // YouTube IDs are alphanumeric with possible dashes and underscores
+        QRegularExpression youtubeIdPattern("^[A-Za-z0-9_-]{11}$");
+        if (youtubeIdPattern.match(potentialYouTubeId).hasMatch())
+        {
+            LOG_INFO("Detected YouTube ID format: {}", potentialYouTubeId.toStdString());
+            return potentialYouTubeId;
+        }
     }
 
-    // If no underscore, take first 10 characters
-    return baseName.left(10);
+    // Fallback: use the full filename (without extension) as prefix
+    LOG_INFO("Using full filename as prefix: {}", baseName.toStdString());
+    return baseName;
 }
 
 void MainWindow::setDefaultFilenamePrefix(const QString &videoPath)
 {
     if (m_filenamePrefixEdit && !videoPath.isEmpty())
     {
+        QString currentPrefix = m_filenamePrefixEdit->text();
         QString prefix = extractFilenamePrefix(videoPath);
+        LOG_INFO("Current prefix: '{}', Extracted prefix: '{}'", currentPrefix.toStdString(), prefix.toStdString());
+
         if (!prefix.isEmpty())
         {
             m_filenamePrefixEdit->setText(prefix);
-            LOG_INFO("Set filename prefix to: {}", prefix.toStdString());
+            LOG_INFO("Successfully set filename prefix to: {}", prefix.toStdString());
         }
     }
+    else
+    {
+        LOG_WARN("Cannot set filename prefix: edit field={}, videoPath='{}'",
+                 (m_filenamePrefixEdit != nullptr), videoPath.toStdString());
+    }
+}
+
+void MainWindow::updateFilePathDisplay(const QString &filePath)
+{
+    if (!m_filePathLabel)
+        return;
+
+    if (filePath.isEmpty())
+    {
+        m_filePathLabel->setText("No video loaded");
+        m_filePathLabel->setToolTip("");
+        return;
+    }
+
+    QFileInfo fileInfo(filePath);
+    QString fileName = fileInfo.fileName();
+    QString displayText;
+
+    // If the full path is short enough, show it all
+    if (filePath.length() <= 80)
+    {
+        displayText = filePath;
+    }
+    // Otherwise prioritize showing the filename
+    else if (fileName.length() <= 50)
+    {
+        QString dir = fileInfo.dir().absolutePath();
+        int maxDirLength = 80 - fileName.length() - 4; // Reserve space for filename and ".../"
+        if (dir.length() > maxDirLength)
+        {
+            dir = "..." + dir.right(maxDirLength - 3);
+        }
+        displayText = dir + "/" + fileName;
+    }
+    else
+    {
+        // Very long filename, truncate it
+        displayText = "..." + fileName.right(77);
+    }
+
+    m_filePathLabel->setText(displayText);
+    m_filePathLabel->setToolTip(filePath); // Full path in tooltip
 }
 
 void MainWindow::loadSettings()
@@ -1110,12 +1176,20 @@ void MainWindow::loadSettings()
         LOG_INFO("Restored output directory: {}", outputDir.toStdString());
     }
 
-    // Load filename prefix
-    QString filenamePrefix = settings.value("filenamePrefix", "frame").toString();
-    if (m_filenamePrefixEdit)
+    // Load filename prefix ONLY if no video will be auto-loaded
+    // If video will be auto-loaded, let setDefaultFilenamePrefix handle it
+    if (m_lastVideoPath.isEmpty())
     {
-        m_filenamePrefixEdit->setText(filenamePrefix);
-        LOG_INFO("Restored filename prefix: {}", filenamePrefix.toStdString());
+        QString filenamePrefix = settings.value("filenamePrefix", "frame").toString();
+        if (m_filenamePrefixEdit)
+        {
+            m_filenamePrefixEdit->setText(filenamePrefix);
+            LOG_INFO("Restored filename prefix: {}", filenamePrefix.toStdString());
+        }
+    }
+    else
+    {
+        LOG_INFO("Will auto-extract filename prefix from video file, skipping saved prefix");
     }
 
     // Load window geometry
@@ -1175,28 +1249,14 @@ QString MainWindow::generateFrameFilename()
     // Get current video position in milliseconds
     qint64 videoPosition = m_mediaPlayer ? m_mediaPlayer->position() : 0;
 
-    // Get current timestamp for uniqueness
-    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
+    // Convert position to seconds for presentation timestamp
+    qint64 presentationTimestamp = videoPosition / 1000;
 
-    // Get video size if available - fallback to default size for filename
-    QSize videoSize = QSize(1920, 1080);
-    if (m_frameCaptureSink)
-    {
-        QVideoFrame currentFrame = m_frameCaptureSink->getCurrentFrame();
-        if (currentFrame.isValid())
-        {
-            videoSize = currentFrame.size();
-        }
-    }
-
-    // Generate filename: prefix_timestamp_videoposition_width_height.png
+    // Generate filename: {prefix}_{presentationtimestamp}.png
     // This allows us to extract the video position later for timeline marking
-    return QString("%1_%2_%3ms_%4_%5.png")
+    return QString("%1_%2.png")
         .arg(prefix)
-        .arg(timestamp)
-        .arg(videoPosition)
-        .arg(videoSize.width())
-        .arg(videoSize.height());
+        .arg(presentationTimestamp);
 }
 
 void MainWindow::captureCurrentFrame()
@@ -1507,24 +1567,45 @@ qint64 MainWindow::extractTimestampFromFilename(const QString &filename)
 
     LOG_DEBUG("Extracting timestamp from: '{}' with prefix: '{}'", filename.toStdString(), currentPrefix.toStdString());
 
-    // Try NEW filename format first: prefix_YYYYMMDD_hhmmss_zzz_XXXXms_width_height.ext
-    QString newPattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)ms_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+    // Try NEW simplified format: prefix_presentationtimestamp.ext
+    QString newPattern = QString("^%1_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
                              .arg(QRegularExpression::escape(currentPrefix));
     QRegularExpression newFormatRegex(newPattern, QRegularExpression::CaseInsensitiveOption);
     QRegularExpressionMatch newMatch = newFormatRegex.match(filename);
 
-    LOG_DEBUG("Testing new format pattern: {}", newPattern.toStdString());
+    LOG_DEBUG("Testing new simplified format pattern: {}", newPattern.toStdString());
 
     if (newMatch.hasMatch())
     {
-        // Extract video position from the new format
-        qint64 videoPosition = newMatch.captured(4).toLongLong();
-        LOG_INFO("✓ Extracted video position from new format: {}ms", videoPosition);
+        // Extract presentation timestamp (in seconds) and convert to milliseconds
+        qint64 presentationTimestamp = newMatch.captured(1).toLongLong();
+        qint64 videoPosition = presentationTimestamp * 1000; // Convert to milliseconds
+        LOG_INFO("✓ Extracted presentation timestamp from new format: {}s ({}ms)", presentationTimestamp, videoPosition);
         return videoPosition;
     }
     else
     {
-        LOG_DEBUG("✗ New format pattern didn't match");
+        LOG_DEBUG("✗ New simplified format pattern didn't match");
+    }
+
+    // Try OLD detailed format for backward compatibility: prefix_YYYYMMDD_hhmmss_zzz_XXXXms_width_height.ext
+    QString oldDetailedPattern = QString("^%1_(\\d{8})_(\\d{6})_(\\d{3})_(\\d+)ms_(\\d+)_(\\d+)\\.(png|jpg|jpeg|bmp|tiff)$")
+                                     .arg(QRegularExpression::escape(currentPrefix));
+    QRegularExpression oldDetailedRegex(oldDetailedPattern, QRegularExpression::CaseInsensitiveOption);
+    QRegularExpressionMatch oldDetailedMatch = oldDetailedRegex.match(filename);
+
+    LOG_DEBUG("Testing old detailed format pattern: {}", oldDetailedPattern.toStdString());
+
+    if (oldDetailedMatch.hasMatch())
+    {
+        // Extract video position from the old detailed format
+        qint64 videoPosition = oldDetailedMatch.captured(4).toLongLong();
+        LOG_INFO("✓ Extracted video position from old detailed format: {}ms", videoPosition);
+        return videoPosition;
+    }
+    else
+    {
+        LOG_DEBUG("✗ Old detailed format pattern didn't match");
     }
 
     // Try OLD filename format for backward compatibility: prefix_YYYYMMDD_hhmmss_zzz_width_height.ext

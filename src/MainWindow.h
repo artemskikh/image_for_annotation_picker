@@ -78,6 +78,7 @@ private:
     void captureCurrentFrame();
     QString extractFilenamePrefix(const QString &videoPath);
     void setDefaultFilenamePrefix(const QString &videoPath);
+    void updateFilePathDisplay(const QString &filePath);
 
     // Frame capture methods
     enum FrameCaptureMethod
@@ -140,6 +141,7 @@ private:
 
     // Status
     QProgressBar *m_progressBar;
+    QLabel *m_filePathLabel;
 
     // Frame stepping
     QTimer *m_frameStepTimer;
